@@ -328,23 +328,6 @@ clang::InitListExpr* GetSyntacticForm(clang::InitListExpr* ILE) {
 const clang::InitListExpr* GetSyntacticForm(const clang::InitListExpr* ILE) {
   return (ILE->isSyntacticForm() ? ILE : ILE->getSyntacticForm());
 }
-
-clang::Decl* GetInfluencedDeclFromLExpression(clang::Expr* lhs) {
-  if (auto* expr = llvm::dyn_cast_or_null<clang::DeclRefExpr>(lhs);
-      expr != nullptr && expr->getFoundDecl() != nullptr &&
-      (expr->getFoundDecl()->getKind() == clang::Decl::Kind::Var ||
-       expr->getFoundDecl()->getKind() == clang::Decl::Kind::ParmVar)) {
-    return expr->getFoundDecl();
-  }
-  if (auto* expr = llvm::dyn_cast_or_null<clang::MemberExpr>(lhs);
-      expr != nullptr) {
-    if (auto* member = expr->getMemberDecl(); member != nullptr) {
-      return member;
-    }
-  }
-  return nullptr;
-}
-
 }  // anonymous namespace
 
 bool IsClaimableForTraverse(const clang::Decl* decl) {
@@ -2161,6 +2144,35 @@ bool IndexerASTVisitor::TraverseFieldDecl(clang::FieldDecl* Decl) {
   return true;
 }
 
+clang::Decl* IndexerASTVisitor::GetInfluencedDeclFromLExpression(
+    clang::Expr* lhs) {
+  if (lhs == nullptr) return nullptr;
+  if (auto* expr = llvm::dyn_cast_or_null<clang::CastExpr>(lhs)) {
+    return GetInfluencedDeclFromLExpression(expr->getSubExpr());
+  }
+  if (auto* expr = llvm::dyn_cast_or_null<clang::DeclRefExpr>(lhs);
+      expr != nullptr && expr->getFoundDecl() != nullptr &&
+      (expr->getFoundDecl()->getKind() == clang::Decl::Kind::Var ||
+       expr->getFoundDecl()->getKind() == clang::Decl::Kind::ParmVar)) {
+    return expr->getFoundDecl();
+  }
+  if (auto* expr = llvm::dyn_cast_or_null<clang::MemberExpr>(lhs);
+      expr != nullptr) {
+    TraverseStmt(expr->getBase());
+    if (auto* member = expr->getMemberDecl(); member != nullptr) {
+      return member;
+    }
+  }
+  if (auto* expr = llvm::dyn_cast_or_null<clang::ArraySubscriptExpr>(lhs);
+      expr != nullptr) {
+    TraverseStmt(expr->getIdx());
+    if (auto* base = expr->getBase(); base != nullptr) {
+      return GetInfluencedDeclFromLExpression(base);
+    }
+  }
+  return nullptr;
+}
+
 bool IndexerASTVisitor::TraverseBinaryOperator(clang::BinaryOperator* BO) {
   if (!DataflowEdges) {
     return Base::TraverseBinaryOperator(BO);
@@ -2171,7 +2183,14 @@ bool IndexerASTVisitor::TraverseBinaryOperator(clang::BinaryOperator* BO) {
   if (auto rhs = BO->getRHS(), lhs = BO->getLHS();
       lhs != nullptr && rhs != nullptr) {
     if (!WalkUpFromBinaryOperator(BO)) return false;
+    absl::flat_hash_set<const clang::Decl*> prev;
+    if (!Job->InfluenceSets.empty()) {
+      prev = Job->InfluenceSets.back();
+    }
     if (!TraverseStmt(lhs)) return false;
+    if (!prev.empty()) {
+      Job->InfluenceSets.back() = prev;
+    }
     auto scope_guard = PushScope(Job->InfluenceSets, {});
     if (!TraverseStmt(rhs)) {
       return false;

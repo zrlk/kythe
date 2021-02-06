@@ -3258,6 +3258,15 @@ cc_indexer_test(
     name = "df_field_influence",
     srcs = ["df/df_field_influence.cc"],
     experimental_record_dataflow_edges = True,
+    ignore_dups = True,
+    tags = ["df"],
+)
+
+cc_indexer_test(
+    name = "df_array_influence",
+    srcs = ["df/df_array_influence.cc"],
+    experimental_record_dataflow_edges = True,
+    ignore_dups = True,
     tags = ["df"],
 )
 

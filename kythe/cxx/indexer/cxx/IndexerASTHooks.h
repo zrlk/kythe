@@ -133,6 +133,8 @@ class IndexerASTVisitor : public RecursiveTypeVisitor<IndexerASTVisitor> {
 
   bool TraverseCallExpr(clang::CallExpr* CE);
   bool TraverseReturnStmt(clang::ReturnStmt* RS);
+
+  clang::Decl* GetInfluencedDeclFromLExpression(clang::Expr* lhs);
   bool TraverseBinaryOperator(clang::BinaryOperator* BO);
 
   bool TraverseInitListExpr(clang::InitListExpr* ILE);
