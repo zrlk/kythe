@@ -69,10 +69,10 @@ enum E {
 }
 
 // FunctionDeclaration
-//- @#1"fun" defines/binding VName("fun", _, _, "testdata/schema", "typescript")
+//- @#1"fun" defines/binding VName("fun:number:$", _, _, "testdata/schema", "typescript")
 function fun(
     // Parameter
-    //- @param defines/binding VName("fun.param", _, _, "testdata/schema", "typescript")
+    //- @param defines/binding VName("fun:number:$.param", _, _, "testdata/schema", "typescript")
     param: number) {}
 
 // InterfaceDeclaration

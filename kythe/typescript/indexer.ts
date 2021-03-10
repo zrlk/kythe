@@ -19,8 +19,10 @@ import 'source-map-support/register';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as ts from 'typescript';
+import {runInThisContext} from 'vm';
 
 import {MarkedSource} from '../proto/common_pb';
+
 import {EdgeKind, FactName, JSONEdge, JSONFact, makeOrdinalEdge, NodeKind, OrdinalEdge, Subkind, VName} from './kythe';
 import * as utf8 from './utf8';
 
@@ -46,11 +48,11 @@ export interface IndexerHost {
    */
   getSymbolAtLocation(node: ts.Node): ts.Symbol|undefined;
   /**
-   * Computes the VName (and signature) of a ts.Symbol. A Context can be
-   * optionally specified to help disambiguate nodes with multiple declarations.
-   * See the documentation of Context for more information.
+   * Computes the VName (and signature) of a ts.Symbol. A specific decl context
+   * can be optionally specified to help disambiguate nodes with multiple
+   * declarations.
    */
-  getSymbolName(sym: ts.Symbol, ns: TSNamespace, context?: Context): VName
+  getSymbolName(sym: ts.Symbol, ns: TSNamespace, context?: ts.Node): VName
       |undefined;
   /**
    * scopedSignature computes a scoped name for a ts.Node.
@@ -69,6 +71,11 @@ export interface IndexerHost {
    * See moduleName() for more details.
    */
   moduleName(path: string): string;
+  /**
+   * anonName assigns a freshly generated name to a Node.
+   * It's used to give stable names to e.g. anonymous objects.
+   */
+  anonName(node: ts.Node): string;
   /**
    * Paths to index.
    */
@@ -181,7 +188,7 @@ function todo(sourceRoot: string, node: ts.Node, message: string) {
   console.warn(`TODO: ${file}:${line}:${character}: ${message}`);
 }
 
-type NamespaceAndContext = string&{__brand: 'nsctx'};
+type NamespaceAndContext = [TSNamespace, ts.Node?];
 /**
  * A SymbolVNameStore stores a mapping of symbols to the (many) VNames it may
  * have. Each TypeScript symbol can be be of a different TypeScript namespace
@@ -209,12 +216,12 @@ class SymbolVNameStore {
    * Each instance of a JavaScript object is unique, so using one as a key fails
    * because a new object would be generated every time the store is queried.
    */
-  private serialize(ns: TSNamespace, context: Context): NamespaceAndContext {
-    return `${ns}${context}` as NamespaceAndContext;
+  private serialize(ns: TSNamespace, context?: ts.Node): NamespaceAndContext {
+    return [ns, context];
   }
 
   /** Get a symbol VName for a given namespace and context, if it exists. */
-  get(symbol: ts.Symbol, ns: TSNamespace, context: Context): VName|undefined {
+  get(symbol: ts.Symbol, ns: TSNamespace, context?: ts.Node): VName|undefined {
     if (this.store.has(symbol)) {
       const nsCtx = this.serialize(ns, context);
       return this.store.get(symbol)!.get(nsCtx);
@@ -226,7 +233,8 @@ class SymbolVNameStore {
    * Set a symbol VName for a given namespace and context. Throws if a VName
    * already exists.
    */
-  set(symbol: ts.Symbol, ns: TSNamespace, context: Context, vname: VName) {
+  set(symbol: ts.Symbol, ns: TSNamespace, context: ts.Node|undefined,
+      vname: VName) {
     let vnameMap = this.store.get(symbol);
     const nsCtx = this.serialize(ns, context);
     if (vnameMap) {
@@ -241,7 +249,7 @@ class SymbolVNameStore {
 
     // Set the symbol VName for the given namespace and `Any` context, if it has
     // not already been set.
-    const nsAny = this.serialize(ns, Context.Any);
+    const nsAny = this.serialize(ns, undefined);
     vnameMap = this.store.get(symbol)!;
     if (!vnameMap.has(nsAny)) {
       vnameMap.set(nsAny, vname);
@@ -328,10 +336,6 @@ class StandardIndexerContext implements IndexerHost {
     return this.typeChecker.getSymbolAtLocation(node);
   }
 
-  /**
-   * anonName assigns a freshly generated name to a Node.
-   * It's used to give stable names to e.g. anonymous objects.
-   */
   anonName(node: ts.Node): string {
     let name = this.anonNames.get(node);
     if (!name) {
@@ -379,13 +383,13 @@ class StandardIndexerContext implements IndexerHost {
           break;
         case ts.SyntaxKind.ArrowFunction:
           // Arrow functions are anonymous, so generate a unique id.
-          parts.push(`arrow${this.anonId++}`);
+          parts.push(`arrow${this.anonName(node)}`);
           break;
         case ts.SyntaxKind.FunctionExpression:
           // Function expressions look like
           //   (function() {})
           // which have no name but introduce an anonymous scope.
-          parts.push(`func${this.anonId++}`);
+          parts.push(`func${this.anonName(node)}`);
           break;
         case ts.SyntaxKind.Block:
           // Blocks need their own scopes for contained variable declarations.
@@ -403,7 +407,7 @@ class StandardIndexerContext implements IndexerHost {
             // simpler.)
             continue;
           }
-          parts.push(`block${this.anonId++}`);
+          parts.push(`block${this.anonName(node)}`);
           break;
         case ts.SyntaxKind.ForStatement:
         case ts.SyntaxKind.ForInStatement:
@@ -412,7 +416,7 @@ class StandardIndexerContext implements IndexerHost {
           // statement, so that the two 'x's declared here get different names:
           //   for (const x in y) { ... }
           //   for (const x in y) { ... }
-          parts.push(`for${this.anonId++}`);
+          parts.push(`for${this.anonName(node)}`);
           break;
         case ts.SyntaxKind.BindingElement:
         case ts.SyntaxKind.ClassDeclaration:
@@ -479,6 +483,41 @@ class StandardIndexerContext implements IndexerHost {
                 } else if (ts.isSetAccessor(decl)) {
                   part += ':setter';
                 }
+                if (ts.isFunctionDeclaration(decl)) {
+                  // TODO(zarko): What else can be overloaded?
+                  let sig = decl as ts.FunctionDeclaration;
+                  let comma = false;
+                  if (sig.typeParameters) {
+                    part += '<';
+                    for (let typaram of sig.typeParameters) {
+                      if (comma) {
+                        part += ',';
+                      }
+                      part += typaram.getText();
+                      comma = true;
+                    }
+                    part += '>';
+                  }
+                  comma = false;
+                  part += ':';
+                  for (let param of sig.parameters) {
+                    if (comma) {
+                      part += ',';
+                    }
+                    if (param.type) {
+                      part += param.type.getText();
+                    } else {
+                      part += '$';
+                    }
+                    comma = true;
+                  }
+                  if (sig.type) {
+                    part += ':';
+                    part += sig.type.getText();
+                  } else {
+                    part += ':$';
+                  }
+                }
                 parts.push(part);
                 break;
               default:
@@ -543,7 +582,7 @@ class StandardIndexerContext implements IndexerHost {
           // name, like `src` in
           //   <img src={a} />
           //   <img src={b} />
-          parts.push(`jsx${this.anonId++}`);
+          parts.push(`jsx${this.anonName(node)}`);
           break;
         default:
           // Most nodes are children of other nodes that do not introduce a
@@ -574,32 +613,19 @@ class StandardIndexerContext implements IndexerHost {
    * optionally specified to help disambiguate nodes with multiple declarations.
    * See the documentation of Context for more information.
    */
-  getSymbolName(
-      sym: ts.Symbol, ns: TSNamespace, context: Context = Context.Any): VName
+  getSymbolName(sym: ts.Symbol, ns: TSNamespace, context?: ts.Node): VName
       |undefined {
     const stored = this.symbolNames.get(sym, ns, context);
-    if (stored) return stored;
+    if (stored) {
+      return stored;
+    }
 
     let declarations = sym.declarations;
     if (!declarations || declarations.length < 1) {
       return undefined;
     }
 
-    // Disambiguate symbols with multiple declarations using a context.
-    if (sym.declarations.length > 1) {
-      switch (context) {
-        case Context.Getter:
-          declarations = declarations.filter(ts.isGetAccessor);
-          break;
-        case Context.Setter:
-          declarations = declarations.filter(ts.isSetAccessor);
-          break;
-        default:
-          break;
-      }
-    }
-
-    const decl = declarations[0];
+    const decl = context ? context : declarations[0];
     const vname = this.scopedSignature(decl);
     // The signature of a value is undecorated.
     // The signature of a type has the #type suffix.
@@ -1120,22 +1146,18 @@ class Visitor {
 
   getSymbolAndVNameForFunctionDeclaration(node: ts.FunctionLikeDeclaration):
       {sym?: ts.Symbol, vname?: VName} {
-    let context: Context|undefined = undefined;
-    if (ts.isGetAccessor(node)) {
-      context = Context.Getter;
-    } else if (ts.isSetAccessor(node)) {
-      context = Context.Setter;
-    }
     if (node.name) {
       const sym = this.host.getSymbolAtLocation(node.name);
       if (!sym) {
         return {};
       }
-      const vname = this.host.getSymbolName(sym, TSNamespace.VALUE, context);
+      const vname = this.host.getSymbolName(sym, TSNamespace.VALUE, node);
       return {sym, vname};
     } else {
       // TODO: choose VName for anonymous functions and return symbol
-      return {vname: this.newVName('TODO', 'TODOPath')};
+      return {
+        vname: this.newVName('TODO' + this.host.anonName(node), 'TODOPath')
+      };
     }
   }
 
@@ -1429,17 +1451,17 @@ class Visitor {
     const sym = this.host.getSymbolAtLocation(decl.name);
     if (!sym) throw new Error('Getter/setter declaration has no symbols.');
 
-    if (sym.declarations.find(ts.isGetAccessor)) {
+    let getDecl = sym.declarations.find(ts.isGetAccessor);
+    if (getDecl) {
       // Emit a "property/reads" edge between the getter and the property
-      const getter =
-          this.host.getSymbolName(sym, TSNamespace.VALUE, Context.Getter);
+      const getter = this.host.getSymbolName(sym, TSNamespace.VALUE, getDecl);
       if (!getter) return;
       this.emitEdge(getter, EdgeKind.PROPERTY_READS, implicitProp);
     }
-    if (sym.declarations.find(ts.isSetAccessor)) {
+    let setDecl = sym.declarations.find(ts.isSetAccessor);
+    if (setDecl) {
       // Emit a "property/writes" edge between the setter and the property
-      const setter =
-          this.host.getSymbolName(sym, TSNamespace.VALUE, Context.Setter);
+      const setter = this.host.getSymbolName(sym, TSNamespace.VALUE, setDecl);
       if (!setter) return;
       this.emitEdge(setter, EdgeKind.PROPERTY_WRITES, implicitProp);
     }
@@ -1831,6 +1853,7 @@ class Visitor {
     // view in the following expression: `const k = {[foo]() {}};` the part
     // `[foo]` isn't a separate symbol that you can click. Only `foo` should be
     // xref'ed and lead to the `foo` definition.
+    let declAnchor;
     if (decl.name && !isNameComputedProperty) {
       if (!sym) {
         todo(
@@ -1839,7 +1862,7 @@ class Visitor {
         return;
       }
 
-      const declAnchor = this.newAnchor(decl.name);
+      declAnchor = this.newAnchor(decl.name);
       this.emitNode(vname, NodeKind.FUNCTION);
       this.emitEdge(declAnchor, EdgeKind.DEFINES_BINDING, vname);
 
@@ -1889,6 +1912,22 @@ class Visitor {
     if (decl.typeParameters) this.visitTypeParameters(decl.typeParameters);
     if (decl.body) {
       this.visit(decl.body);
+      this.emitFact(vname, FactName.COMPLETE, 'definition');
+      if (!sym || !declAnchor) return;
+      let declarations = sym.declarations;
+      if (!declarations || declarations.length < 2) return;
+      for (let declaration of declarations) {
+        if (ts.isFunctionDeclaration(declaration)) {
+          let remote = declaration as ts.FunctionDeclaration;
+          if (!remote.body) {
+            const remotes =
+                this.getSymbolAndVNameForFunctionDeclaration(remote);
+            if (remotes.vname) {
+              this.emitEdge(declAnchor, EdgeKind.COMPLETES, remotes.vname);
+            }
+          }
+        }
+      }
     } else {
       this.emitFact(vname, FactName.COMPLETE, 'incomplete');
     }
